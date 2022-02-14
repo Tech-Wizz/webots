@@ -11,7 +11,6 @@ import WbWrenHdr from './../wren/WbWrenHdr.js';
 import WbWrenGtao from './../wren/WbWrenGtao.js';
 import WbWrenBloom from './../wren/WbWrenBloom.js';
 import WbWrenSmaa from './../wren/WbWrenSmaa.js';
-import {webots} from '../webots.js';
 
 export default class WbViewpoint extends WbBaseNode {
   constructor(id, fieldOfView, orientation, position, exposure, bloomThreshold, near, far, followSmoothness, followedId, ambientOcclusionRadius) {
@@ -33,8 +32,8 @@ export default class WbViewpoint extends WbBaseNode {
 
     this.followSmoothness = followSmoothness;
     this.followedId = followedId;
-    this._viewpointForce = new WbVector3();
-    this._viewpointVelocity = new WbVector3();
+    this._equilibrium = new WbVector3();
+    this._velocity = new WbVector3();
 
     this._wrenHdr = new WbWrenHdr();
     this._wrenGtao = new WbWrenGtao();
@@ -82,6 +81,9 @@ export default class WbViewpoint extends WbBaseNode {
 
   postFinalize() {
     super.postFinalize();
+
+    if (typeof this.followedId !== 'undefined' && typeof WbWorld.instance.nodes.get(this.followedId) !== 'undefined')
+      this.followedSolidPreviousPosition = WbWorld.instance.nodes.get(this.followedId).translation;
 
     this.updatePostProcessingEffects();
   }
@@ -156,51 +158,50 @@ export default class WbViewpoint extends WbBaseNode {
   updateFollowUp(time, forcePosition) {
     if (typeof this.followedId === 'undefined' || typeof WbWorld.instance.nodes.get(this.followedId) === 'undefined')
       return;
+    const followedSolid = WbWorld.instance.nodes.get(this.followedId);
+    const followedSolidCurrentPosition = followedSolid.translation;
+    const delta = followedSolidCurrentPosition.sub(this.followedSolidPreviousPosition);
+    this.followedSolidPreviousPosition = followedSolidCurrentPosition;
 
-    if (typeof this._viewpointLastUpdate === 'undefined')
-      this._viewpointLastUpdate = time;
-
-    const timeInterval = Math.abs(time - this._viewpointLastUpdate) / 1000;
+    this._equilibrium = this._equilibrium.add(delta);
     const mass = ((this.followSmoothness < 0.05) ? 0.0 : ((this.followSmoothness > 1.0) ? 1.0 : this.followSmoothness));
-
-    if (timeInterval > 0) {
-      this._viewpointLastUpdate = time;
-      let deltaPosition;
-
-      if (typeof this._followedObjectDeltaPosition !== 'undefined')
-        this._viewpointForce = this._viewpointForce.add(this._followedObjectDeltaPosition);
-
-      if (forcePosition || mass === 0 || (timeInterval > 0.1 && typeof webots.animation === 'undefined')) {
-        deltaPosition = new WbVector3(this._viewpointForce.x, this._viewpointForce.y, this._viewpointForce.z);
-        this._viewpointVelocity = new WbVector3();
+    if (mass === 0.0) {
+      this.position = this.position.add(this._equilibrium);
+      this._velocity = new WbVector3();
+      this._equilibrium = new WbVector3();
+    } else {
+      const timeStep = WbWorld.instance.basicTimeStep / 1000.0;
+      const acceleration = this._equilibrium.div(mass);
+      this._velocity = this._velocity.add(acceleration.mul(timeStep));
+      const viewPointScalarVelocity = this._velocity.length();
+      let followedObjectScalarVelocity;
+      let followedObjectVelocity = new WbVector3();
+      if (delta.length() > 0.0) {
+        followedObjectVelocity = delta.div(timeStep);
+        followedObjectScalarVelocity = followedObjectVelocity.dot(this._velocity) / viewPointScalarVelocity;
       } else {
-        let acceleration = new WbVector3(this._viewpointForce.x, this._viewpointForce.y, this._viewpointForce.z);
-        acceleration = acceleration.mul(timeInterval / mass);
-        this._viewpointVelocity = this._viewpointVelocity.add(acceleration);
-        const scalarVelocity = this._viewpointVelocity.length();
-
-        let scalarObjectVelocityProjection;
-        if (typeof this._followedObjectDeltaPosition !== 'undefined') {
-          let objectVelocity = new WbVector3(this._followedObjectDeltaPosition.x, this._followedObjectDeltaPosition.y, this._followedObjectDeltaPosition.z);
-          objectVelocity = objectVelocity.div(timeInterval);
-          scalarObjectVelocityProjection = objectVelocity.dot(this._viewpointVelocity) / scalarVelocity;
-        } else
-          scalarObjectVelocityProjection = 0;
-
-        let viewpointFriction = 0.05 / mass;
-        if (viewpointFriction > 0 && scalarVelocity > scalarObjectVelocityProjection) {
-          const velocityFactor = (scalarVelocity - (scalarVelocity - scalarObjectVelocityProjection) * viewpointFriction) / scalarVelocity;
-          this._viewpointVelocity = this._viewpointVelocity.mul(velocityFactor);
-        }
-
-        deltaPosition = this._viewpointVelocity.mul(timeInterval);
+        followedObjectVelocity = new WbVector3();
+        followedObjectScalarVelocity = 0.0;
       }
-      this._viewpointForce = this._viewpointForce.sub(deltaPosition);
+
+      // If the viewpoint is going faster than the followed object, we slow it down to avoid oscillations
+      if (viewPointScalarVelocity > followedObjectScalarVelocity) {
+        const relativeSpeed = viewPointScalarVelocity - followedObjectScalarVelocity;
+        if (relativeSpeed < 0.0001)
+          this._velocity = this._velocity.mul(followedObjectScalarVelocity * viewPointScalarVelocity);
+        else {
+          let friction = 0.05 / mass;
+          if (friction > 1.0)
+            friction = 1.0;
+          this._velocity = this._velocity.mul((viewPointScalarVelocity - relativeSpeed * friction) / viewPointScalarVelocity);
+        }
+      }
+
+      const deltaPosition = this._velocity.mul(timeStep);
       this.position = this.position.add(deltaPosition);
-      this._defaultPosition = this._defaultPosition.add(deltaPosition);
-      this._followedObjectDeltaPosition = undefined;
-      this.updatePosition();
+      this._equilibrium = this._equilibrium.sub(deltaPosition);
     }
+    this.updatePosition();
   }
 
   setFollowedObjectDeltaPosition(newPosition, previousPosition) {
